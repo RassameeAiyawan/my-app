@@ -1,17 +1,37 @@
 const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');  // เพิ่ม bcrypt สำหรับการเข้ารหัสรหัสผ่าน
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const dotenv = require('dotenv'); // สำหรับการโหลดตัวแปร environment (ควรใช้สำหรับการเก็บค่า secret key)
+dotenv.config();
+
 const app = express();
 
-app.use(cors());  // เปิดให้สามารถเข้าถึงจากภายนอก
-app.use(express.json());  // ให้สามารถรับข้อมูลเป็น JSON
+app.use(cors());
+app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // ให้ Express ให้บริการไฟล์อัปโหลด
 
+// ตั้งค่าการอัปโหลดไฟล์ด้วย multer
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, 'uploads/');
+  },
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ storage: storage });
+
+// เชื่อมต่อกับฐานข้อมูล MySQL
 const db = mysql.createConnection({
   host: 'localhost',
-  user: 'root',  // เปลี่ยนเป็นข้อมูลของคุณ
-  password: '12345678',  // รหัสผ่านของ MySQL
-  database: 'mydatabase'  // ชื่อฐานข้อมูลของคุณ
+  user: 'root',
+  password: '12345678',
+  database: 'mydatabase'
 });
 
 db.connect((err) => {
@@ -20,36 +40,32 @@ db.connect((err) => {
 });
 
 // API สำหรับการสมัครสมาชิก
-app.post('/register', async (req, res) => {
+app.post('/register', upload.single('profileImage'), async (req, res) => {
   const { name, studentId, branch, faculty, university, gpa, username, email, password } = req.body;
 
-  // การตรวจสอบข้อมูลพื้นฐาน (ให้แน่ใจว่าไม่มีข้อมูลที่เป็นค่าว่าง)
   if (!name || !studentId || !username || !email || !password) {
     return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบทุกช่อง' });
   }
 
-  // การเข้ารหัสรหัสผ่านก่อนที่จะบันทึก
-  const hashedPassword = await bcrypt.hash(password, 10);
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-  // ตรวจสอบว่า username หรือ email มีอยู่แล้วหรือไม่
-  const checkQuery = 'SELECT * FROM users WHERE username = ? OR email = ?';
-  db.query(checkQuery, [username, email], (err, result) => {
-    if (err) {
-      return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการตรวจสอบข้อมูลผู้ใช้' });
-    }
+    const [result] = await db.promise().query('SELECT * FROM users WHERE username = ? OR email = ?', [username, email]);
+
     if (result.length > 0) {
       return res.status(400).json({ error: 'มีชื่อผู้ใช้งานหรืออีเมลนี้ในระบบแล้ว' });
     }
+    const profileImage = req.file ? `http://localhost:5000/uploads/${req.file.filename}` : null;
+    await db.promise().query(
+      'INSERT INTO users (name, studentId, branch, faculty, university, gpa, username, email, password, profileImage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, studentId, branch, faculty, university, gpa, username, email, hashedPassword, profileImage]
+    );
 
-    // หากไม่มี username หรือ email ซ้ำ ให้ทำการบันทึกข้อมูลผู้ใช้
-    const query = 'INSERT INTO users (name, studentId, branch, faculty, university, gpa, username, email, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
-    db.query(query, [name, studentId, branch, faculty, university, gpa, username, email, hashedPassword], (err, result) => {
-      if (err) {
-        return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการสมัครสมาชิก' });
-      }
-      res.status(200).json({ message: 'สมัครสมาชิกสำเร็จ' });
-    });
-  });
+    res.status(200).json({ message: 'สมัครสมาชิกสำเร็จ' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการสมัครสมาชิก' });
+  }
 });
 
 // API สำหรับการล็อกอิน
@@ -102,6 +118,99 @@ app.get('/profile', (req, res) => {
   });
 });
 
+// API สำหรับลบโปรไฟล์
+
+app.delete('/profile/:userId', (req, res) => {
+  const userId = req.params.userId;
+  
+  if (!userId) {
+    return res.status(400).json({ error: 'ต้องระบุ User ID' });
+  }
+
+  // คำสั่ง SQL สำหรับการลบโปรไฟล์
+  const query = 'SELECT * FROM users WHERE id = ?';
+  
+  db.query(query, [userId], (err, result) => {
+    if (err) {
+      return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการลบโปรไฟล์' });
+    }
+    if (result.length === 0) {
+      return res.status(404).json({ message: 'ไม่พบโปรไฟล์นี้เพื่อลบ' });
+    }
+
+    // ลบไฟล์ภาพโปรไฟล์ถ้ามี
+    const profileImage = result[0].profileImage;
+    if (profileImage) {
+      const imagePath = path.join(__dirname, 'uploads', path.basename(profileImage));
+      fs.unlink(imagePath, (err) => {
+        if (err) {
+          console.error('ไม่สามารถลบรูปโปรไฟล์ได้:', err);
+        }
+      });
+    }
+
+    // ลบข้อมูลโปรไฟล์ในฐานข้อมูล
+    const deleteQuery = 'DELETE FROM users WHERE id = ?';
+    
+    db.query(deleteQuery, [userId], (err, deleteResult) => {
+      if (err) {
+        return res.status(500).json({ error: 'เกิดข้อผิดพลาดในการลบโปรไฟล์' });
+      }
+      if (deleteResult.affectedRows === 0) {
+        return res.status(404).json({ message: 'ไม่พบโปรไฟล์นี้เพื่อลบ' });
+      }
+      res.status(200).json({ message: 'ลบโปรไฟล์สำเร็จ' });
+    });
+  });
+});
+
+
+// API สำหรับแก้ไขโปรไฟล์
+app.put('/profile/:userId', upload.single('profileImage'), async (req, res) => {
+  const userId = req.params.userId;
+  const { name, studentId, branch, faculty, university, gpa, username, email } = req.body;
+
+  if (!name || !studentId || !username || !email) {
+    return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบทุกช่อง' });
+  }
+
+  try {
+    // ค้นหาข้อมูลของผู้ใช้ในฐานข้อมูล
+    const query = 'SELECT * FROM users WHERE id = ?';
+    const [user] = await db.promise().query(query, [userId]);
+
+    if (user.length === 0) {
+      return res.status(404).json({ message: 'ไม่พบโปรไฟล์นี้' });
+    }
+
+    // หากมีการอัปโหลดไฟล์ภาพโปรไฟล์ใหม่
+    let profileImage = user[0].profileImage;
+    if (req.file) {
+      // ลบไฟล์ภาพเดิมถ้ามี
+      const fs = require('fs');
+      const path = require('path');
+      if (profileImage) {
+        const oldImagePath = path.join(__dirname, 'uploads', path.basename(profileImage));
+        fs.unlink(oldImagePath, (err) => {
+          if (err) {
+            console.error('ไม่สามารถลบไฟล์รูปภาพเดิมได้:', err);
+          }
+        });
+      }
+      // ตั้งค่ารูปภาพใหม่
+      profileImage = `http://localhost:5000/uploads/${req.file.filename}`;
+    }
+
+    // อัปเดตข้อมูลโปรไฟล์ในฐานข้อมูล
+    const updateQuery = 'UPDATE users SET name = ?, studentId = ?, branch = ?, faculty = ?, university = ?, gpa = ?, username = ?, email = ?, profileImage = ? WHERE id = ?';
+    await db.promise().query(updateQuery, [name, studentId, branch, faculty, university, gpa, username, email, profileImage, userId]);
+
+    res.status(200).json({ message: 'โปรไฟล์อัปเดตสำเร็จ' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการอัปเดตโปรไฟล์' });
+  }
+});
 
 
 // เริ่มต้นเซิร์ฟเวอร์
